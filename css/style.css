@@ -1,0 +1,1510 @@
+<?php
+// summaryreport.php - FINAL VERSION WITH EVOLUTION CHARTS
+require_once 'includes/config.php';
+
+try {
+    $database = new Database();
+    $db = $database->getConnection();
+
+    // Get filter options
+    $filterOptions = [];
+    
+    $weatherStmt = $db->query("SELECT Id_Weather, `Condition` FROM Weather_Conditions ORDER BY `Condition`");
+    $filterOptions['weather'] = $weatherStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $trafficStmt = $db->query("SELECT Id_Density, Density FROM Traffic_Density ORDER BY Id_Density");
+    $filterOptions['traffic'] = $trafficStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $roadStmt = $db->query("SELECT Id_Road, Type FROM Road_Type ORDER BY Type");
+    $filterOptions['road'] = $roadStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Build query
+    $where = [];
+    $params = [];
+    
+    if (!empty($_GET['dateFrom'])) {
+        $where[] = "de.DateOfJourney >= :dateFrom";
+        $params[':dateFrom'] = $_GET['dateFrom'];
+    }
+    
+    if (!empty($_GET['dateTo'])) {
+        $where[] = "de.DateOfJourney <= :dateTo";
+        $params[':dateTo'] = $_GET['dateTo'];
+    }
+    
+    if (!empty($_GET['weather'])) {
+        $where[] = "de.Id_Weather = :weather";
+        $params[':weather'] = $_GET['weather'];
+    }
+    
+    if (!empty($_GET['traffic'])) {
+        $where[] = "de.Id_Density = :traffic";
+        $params[':traffic'] = $_GET['traffic'];
+    }
+    
+    if (!empty($_GET['road'])) {
+        $where[] = "de.Id_Road = :road";
+        $params[':road'] = $_GET['road'];
+    }
+    
+    $whereClause = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+    
+    $query = "
+        SELECT 
+            de.Driving_Id,
+            de.DateOfJourney,
+            de.StartingTime,
+            de.EndingTime,
+            de.TraveledKm,
+            wc.`Condition` AS weather_condition,
+            td.Density AS traffic_density,
+            rt.Type AS road_type,
+            GROUP_CONCAT(DISTINCT dm.Maneuver ORDER BY dm.Maneuver SEPARATOR ', ') AS maneuvers_list
+        FROM Driving_Experience de
+        LEFT JOIN Weather_Conditions wc ON de.Id_Weather = wc.Id_Weather
+        LEFT JOIN Traffic_Density td ON de.Id_Density = td.Id_Density
+        LEFT JOIN Road_Type rt ON de.Id_Road = rt.Id_Road
+        LEFT JOIN Experience_Maneuvers em ON de.Driving_Id = em.Driving_Id
+        LEFT JOIN Driving_Maneuvers dm ON em.Id_Maneuver = dm.Id_Maneuver
+        $whereClause
+        GROUP BY de.Driving_Id
+        ORDER BY de.DateOfJourney DESC, de.StartingTime DESC
+    ";
+
+    $stmt = $db->prepare($query);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    
+    $stmt->execute();
+    $experiences = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Calculate stats
+    $totalKm = 0;
+    $totalJourneys = count($experiences);
+    
+    foreach ($experiences as $exp) {
+        $totalKm += $exp['TraveledKm'];
+        
+        // Calculate duration
+        $start = new DateTime($exp['DateOfJourney'] . ' ' . $exp['StartingTime']);
+        $end = new DateTime($exp['DateOfJourney'] . ' ' . $exp['EndingTime']);
+        if ($end < $start) $end->modify('+1 day');
+        $exp['duration'] = $start->diff($end)->format('%H:%I');
+    }
+    
+    $avgKm = $totalJourneys > 0 ? $totalKm / $totalJourneys : 0;
+    
+    // Chart data - Basic distributions
+    $weatherStats = [];
+    $trafficStats = [];
+    $roadStats = [];
+    
+    foreach ($experiences as $exp) {
+        $weatherStats[$exp['weather_condition']] = ($weatherStats[$exp['weather_condition']] ?? 0) + 1;
+        $trafficStats[$exp['traffic_density']] = ($trafficStats[$exp['traffic_density']] ?? 0) + 1;
+        $roadStats[$exp['road_type']] = ($roadStats[$exp['road_type']] ?? 0) + 1;
+    }
+    
+    arsort($weatherStats);
+    $mostCommonWeather = $weatherStats ? array_key_first($weatherStats) : 'N/A';
+    
+    // ========== NEW: Time-based chart data ==========
+    $timeStats = [];
+    $monthlyStats = [];
+    $weeklyStats = [];
+    $dailyStats = [];
+
+    foreach ($experiences as $exp) {
+        $date = new DateTime($exp['DateOfJourney']);
+        
+        // Monthly stats
+        $monthYear = $date->format('M Y');
+        $monthlyStats[$monthYear] = ($monthlyStats[$monthYear] ?? 0) + 1;
+        
+        // Weekly stats (week number)
+        $week = 'Week ' . $date->format('W Y');
+        $weeklyStats[$week] = ($weeklyStats[$week] ?? 0) + 1;
+        
+        // Distance over time (by date)
+        $dateStr = $date->format('Y-m-d');
+        $dailyStats[$dateStr] = ($dailyStats[$dateStr] ?? 0) + $exp['TraveledKm'];
+        
+        // Time-based data for line chart
+        $timeKey = $date->format('Y-m-d');
+        if (!isset($timeStats[$timeKey])) {
+            $timeStats[$timeKey] = [
+                'count' => 0,
+                'distance' => 0,
+                'date' => $dateStr
+            ];
+        }
+        $timeStats[$timeKey]['count']++;
+        $timeStats[$timeKey]['distance'] += $exp['TraveledKm'];
+    }
+
+    // Sort time stats by date
+    ksort($timeStats);
+
+    // Prepare data for line charts
+    $timeLabels = [];
+    $experienceCounts = [];
+    $distanceTotals = [];
+
+    foreach ($timeStats as $key => $data) {
+        $timeLabels[] = $key;
+        $experienceCounts[] = $data['count'];
+        $distanceTotals[] = $data['distance'];
+    }
+
+    // Get top 5 months
+    arsort($monthlyStats);
+    $topMonths = array_slice($monthlyStats, 0, 5, true);
+
+    // Calculate average per day of week
+    $dayOfWeekStats = ['Mon' => 0, 'Tue' => 0, 'Wed' => 0, 'Thu' => 0, 'Fri' => 0, 'Sat' => 0, 'Sun' => 0];
+    $dayOfWeekCount = ['Mon' => 0, 'Tue' => 0, 'Wed' => 0, 'Thu' => 0, 'Fri' => 0, 'Sat' => 0, 'Sun' => 0];
+
+    foreach ($experiences as $exp) {
+        $date = new DateTime($exp['DateOfJourney']);
+        $day = $date->format('D');
+        if (isset($dayOfWeekStats[$day])) {
+            $dayOfWeekStats[$day] += $exp['TraveledKm'];
+            $dayOfWeekCount[$day]++;
+        }
+    }
+
+    // Calculate averages
+    $dayOfWeekAvg = [];
+    foreach ($dayOfWeekStats as $day => $total) {
+        $dayOfWeekAvg[$day] = $dayOfWeekCount[$day] > 0 ? round($total / $dayOfWeekCount[$day], 2) : 0;
+    }
+    // ========== END NEW DATA ==========
+    
+    $filtersActive = !empty($_GET);
+
+} catch (PDOException $e) {
+    $error = "Database error: " . $e->getMessage();
+    $experiences = [];
+    $totalKm = $avgKm = $totalJourneys = 0;
+    $filterOptions = ['weather' => [], 'traffic' => [], 'road' => []];
+    $weatherStats = $trafficStats = $roadStats = [];
+    $mostCommonWeather = 'N/A';
+    $filtersActive = false;
+    
+    // Initialize new variables
+    $timeLabels = $experienceCounts = $distanceTotals = [];
+    $topMonths = $dayOfWeekAvg = [];
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Driving Experience Dashboard</title>
+    
+    <!-- Simple CSS - No external dependencies except Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    
+    <style>
+        /* RESET AND BASE */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        /* HEADER */
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .header-actions {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: white;
+            color: #667eea;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn-secondary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        /* QUICK STATS */
+        .quick-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .stat-box {
+            text-align: center;
+            padding: 15px;
+        }
+        
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        /* FILTERS */
+        .filters {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        }
+        
+        .filters h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .filter-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+        
+        .filter-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+            font-size: 14px;
+        }
+        
+        .filter-input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e5e9;
+            border-radius: 8px;
+            font-size: 15px;
+            transition: all 0.3s;
+        }
+        
+        .filter-input:focus {
+            border-color: #667eea;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .filter-buttons {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        
+        .btn-filter {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .btn-filter:hover {
+            background: #5a6fd8;
+            transform: translateY(-2px);
+        }
+        
+        .btn-clear {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .btn-clear:hover {
+            background: #5a6268;
+        }
+        
+        /* MAIN STATS CARDS */
+        .stats-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .card {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+            text-align: center;
+            border-top: 5px solid #667eea;
+        }
+        
+        .card-icon {
+            font-size: 36px;
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+        
+        .card-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .card-label {
+            color: #666;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .card-note {
+            font-size: 12px;
+            color: #888;
+            margin-top: 8px;
+        }
+        
+        /* DATA TABLE - SIMPLE */
+        .table-section {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        }
+        
+        .table-section h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        
+        .data-table thead {
+            background: #f8f9fa;
+        }
+        
+        .data-table th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #667eea;
+            border-bottom: 2px solid #e1e5e9;
+        }
+        
+        .data-table td {
+            padding: 15px;
+            border-bottom: 1px solid #e1e5e9;
+            vertical-align: middle;
+        }
+        
+        .data-table tbody tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        
+        .weather-badge {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        
+        .traffic-badge {
+            background: #f3e5f5;
+            color: #7b1fa2;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .btn-small {
+            padding: 6px 12px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            transition: all 0.2s;
+        }
+        
+        .btn-edit {
+            background: #4caf50;
+            color: white;
+        }
+        
+        .btn-delete {
+            background: #f44336;
+            color: white;
+        }
+        
+        .btn-small:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        
+        /* CHARTS SECTION */
+        .charts-section {
+            margin-bottom: 40px;
+        }
+        
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 25px;
+        }
+        
+        .chart-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+            height: 400px;
+        }
+        
+        .chart-card h3 {
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .chart-container {
+            height: 300px;
+            width: 100%;
+            position: relative;
+        }
+        
+        /* NEW: Chart Notes */
+        .chart-note {
+            font-size: 12px;
+            color: #888;
+            margin-top: 10px;
+            text-align: center;
+            font-style: italic;
+        }
+        
+        /* NO DATA */
+        .no-data {
+            text-align: center;
+            padding: 60px 20px;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        }
+        
+        .no-data i {
+            font-size: 64px;
+            color: #667eea;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .no-data h3 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .no-data p {
+            color: #666;
+            margin-bottom: 25px;
+        }
+        
+        /* FOOTER */
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+            background: white;
+            border-radius: 10px;
+            margin-top: 40px;
+            box-shadow: 0 -5px 20px rgba(0,0,0,0.05);
+        }
+        
+        /* RESPONSIVE */
+        @media (max-width: 1200px) {
+            .filter-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+            
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        @media (max-width: 992px) {
+            .quick-stats,
+            .stats-cards {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .filter-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .quick-stats,
+            .stats-cards {
+                grid-template-columns: 1fr;
+            }
+            
+            .filter-buttons {
+                flex-direction: column;
+            }
+            
+            .btn-filter, .btn-clear {
+                width: 100%;
+                justify-content: center;
+            }
+            
+            .data-table {
+                display: block;
+                overflow-x: auto;
+                white-space: nowrap;
+            }
+            
+            .chart-card {
+                height: 350px;
+            }
+            
+            /* MOBILE OPTIMIZATION CSS */
+            .table-container {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                margin: 10px 0;
+            }
+            
+            .simple-table {
+                min-width: 800px;
+                font-size: 14px;
+            }
+            
+            .simple-table th,
+            .simple-table td {
+                padding: 12px 8px;
+                font-size: 14px;
+            }
+            
+            .btn, .btn-action, .btn-small, .btn-filter, .btn-clear {
+                min-height: 44px;
+                padding: 12px 15px;
+                font-size: 16px;
+            }
+            
+            .action-buttons {
+                gap: 10px;
+            }
+            
+            .btn-small {
+                padding: 10px 15px;
+                min-width: 70px;
+            }
+            
+            input, select, textarea, .filter-input, .form-control {
+                font-size: 16px !important;
+                padding: 14px !important;
+                height: auto;
+                min-height: 48px;
+            }
+            
+            .dashboard-container {
+                padding: 0 5px;
+            }
+            
+            .filter-buttons {
+                gap: 10px;
+            }
+            
+            .btn-filter, .btn-clear, .btn-reset {
+                width: 100%;
+                margin-bottom: 5px;
+            }
+            
+            .card {
+                padding: 20px 15px;
+                margin-bottom: 15px;
+            }
+            
+            .chart-card {
+                height: 350px;
+                padding: 15px;
+                margin-bottom: 20px;
+            }
+            
+            .chart-container {
+                height: 280px;
+            }
+            
+            .quick-stats {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+                padding: 15px;
+            }
+            
+            .stat-box {
+                padding: 10px 5px;
+            }
+            
+            .stat-value {
+                font-size: 24px;
+            }
+            
+            .header {
+                padding: 15px;
+                border-radius: 10px;
+                margin-bottom: 15px;
+            }
+            
+            .header h1 {
+                font-size: 20px;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            
+            .header-actions {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .filters {
+                padding: 15px;
+                border-radius: 10px;
+                margin-bottom: 15px;
+            }
+            
+            .filter-grid {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+            
+            .stats-cards {
+                grid-template-columns: 1fr;
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+            
+            .card-value {
+                font-size: 28px;
+            }
+            
+            .table-section {
+                padding: 15px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+            }
+            
+            .data-table th,
+            .data-table td {
+                padding: 10px 8px;
+                font-size: 14px;
+            }
+            
+            .charts-grid {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+            
+            .footer {
+                padding: 15px;
+                margin-top: 30px;
+                font-size: 14px;
+            }
+            
+            .alert {
+                padding: 12px 15px;
+                font-size: 14px;
+                margin-bottom: 15px;
+            }
+            
+            .no-data {
+                padding: 40px 15px;
+                margin: 20px 0;
+            }
+            
+            .no-data i {
+                font-size: 48px;
+            }
+            
+            .badge {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+        }
+        
+        /* Extra Small Phones */
+        @media (max-width: 480px) {
+            .quick-stats {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+            
+            .stat-value {
+                font-size: 22px;
+            }
+            
+            .btn {
+                padding: 10px 12px;
+                font-size: 15px;
+            }
+            
+            .simple-table {
+                min-width: 700px;
+                font-size: 13px;
+            }
+            
+            .simple-table th,
+            .simple-table td {
+                padding: 10px 6px;
+            }
+            
+            .chart-card {
+                height: 320px;
+                padding: 12px;
+            }
+            
+            .chart-container {
+                height: 250px;
+            }
+            
+            .header h1 {
+                font-size: 18px;
+            }
+            
+            .header-actions .btn {
+                font-size: 14px;
+                padding: 10px;
+            }
+        }
+        
+        /* MESSAGES */
+        .alert {
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border-left: 4px solid #28a745;
+        }
+        
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border-left: 4px solid #dc3545;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>
+                <i class="fas fa-car"></i>
+                Driving Experience Dashboard
+                <?php if($filtersActive): ?>
+                    <span style="background: rgba(255,255,255,0.3); padding: 4px 12px; border-radius: 20px; font-size: 14px;">FILTERS ACTIVE</span>
+                <?php endif; ?>
+            </h1>
+            
+            <div class="header-actions">
+                <a href="index.php" class="btn btn-primary">
+                    <i class="fas fa-plus-circle"></i>
+                    Add New Experience
+                </a>
+                <a href="#charts" class="btn btn-secondary">
+                    <i class="fas fa-chart-bar"></i>
+                    View Charts
+                </a>
+            </div>
+            
+            <div class="quick-stats">
+                <div class="stat-box">
+                    <div class="stat-value"><?php echo number_format($totalKm, 1); ?> km</div>
+                    <div class="stat-label">Total Distance</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value"><?php echo $totalJourneys; ?></div>
+                    <div class="stat-label">Total Journeys</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value"><?php echo number_format($avgKm, 1); ?> km</div>
+                    <div class="stat-label">Avg. Distance</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value"><?php echo $mostCommonWeather; ?></div>
+                    <div class="stat-label">Common Weather</div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Messages -->
+        <?php if(isset($_GET['message']) && $_GET['message'] == 'saved'): ?>
+            <div class="alert alert-success">
+                <i class="fas fa-check-circle"></i>
+                Driving experience saved successfully!
+            </div>
+        <?php endif; ?>
+        
+        <?php if(isset($_GET['message']) && $_GET['message'] == 'updated'): ?>
+            <div class="alert alert-success">
+                <i class="fas fa-check-circle"></i>
+                Driving experience updated successfully!
+            </div>
+        <?php endif; ?>
+        
+        <?php if(isset($error)): ?>
+            <div class="alert alert-error">
+                <i class="fas fa-exclamation-triangle"></i>
+                <?php echo $error; ?>
+            </div>
+        <?php endif; ?>
+
+        <!-- Filters -->
+        <section class="filters">
+            <h2><i class="fas fa-filter"></i> Filter Experiences</h2>
+            
+            <form method="GET" id="filterForm">
+                <div class="filter-grid">
+                    <div class="filter-group">
+                        <label for="dateFrom"><i class="fas fa-calendar"></i> From Date</label>
+                        <input type="date" id="dateFrom" name="dateFrom" 
+                               value="<?php echo $_GET['dateFrom'] ?? ''; ?>" 
+                               class="filter-input">
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="dateTo"><i class="fas fa-calendar"></i> To Date</label>
+                        <input type="date" id="dateTo" name="dateTo" 
+                               value="<?php echo $_GET['dateTo'] ?? ''; ?>" 
+                               class="filter-input">
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="weather"><i class="fas fa-cloud"></i> Weather</label>
+                        <select id="weather" name="weather" class="filter-input">
+                            <option value="">All Weather</option>
+                            <?php foreach($filterOptions['weather'] as $weather): ?>
+                                <option value="<?php echo $weather['Id_Weather']; ?>"
+                                    <?php echo (isset($_GET['weather']) && $_GET['weather'] == $weather['Id_Weather']) ? 'selected' : ''; ?>>
+                                    <?php echo htmlspecialchars($weather['Condition']); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="traffic"><i class="fas fa-traffic-light"></i> Traffic</label>
+                        <select id="traffic" name="traffic" class="filter-input">
+                            <option value="">All Traffic</option>
+                            <?php foreach($filterOptions['traffic'] as $traffic): ?>
+                                <option value="<?php echo $traffic['Id_Density']; ?>"
+                                    <?php echo (isset($_GET['traffic']) && $_GET['traffic'] == $traffic['Id_Density']) ? 'selected' : ''; ?>>
+                                    <?php echo htmlspecialchars($traffic['Density']); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="filter-group">
+                        <label for="road"><i class="fas fa-road"></i> Road Type</label>
+                        <select id="road" name="road" class="filter-input">
+                            <option value="">All Roads</option>
+                            <?php foreach($filterOptions['road'] as $road): ?>
+                                <option value="<?php echo $road['Id_Road']; ?>"
+                                    <?php echo (isset($_GET['road']) && $_GET['road'] == $road['Id_Road']) ? 'selected' : ''; ?>>
+                                    <?php echo htmlspecialchars($road['Type']); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="filter-buttons">
+                    <button type="submit" class="btn-filter">
+                        <i class="fas fa-filter"></i> Apply Filters
+                    </button>
+                    <button type="button" onclick="resetFilters()" class="btn-clear">
+                        <i class="fas fa-redo"></i> Clear Filters
+                    </button>
+                    
+                    <?php if($filtersActive): ?>
+                        <span style="color: #28a745; font-weight: 500; margin-left: auto;">
+                            <i class="fas fa-info-circle"></i> Filters are active
+                        </span>
+                    <?php endif; ?>
+                </div>
+            </form>
+        </section>
+
+        <!-- Main Statistics -->
+        <section class="stats-cards">
+            <div class="card">
+                <div class="card-icon">
+                    <i class="fas fa-route"></i>
+                </div>
+                <div class="card-value"><?php echo number_format($totalKm, 2); ?> km</div>
+                <div class="card-label">Total Distance</div>
+                <?php if($filtersActive): ?>
+                    <div class="card-note">Filtered data</div>
+                <?php endif; ?>
+            </div>
+            
+            <div class="card">
+                <div class="card-icon">
+                    <i class="fas fa-car-side"></i>
+                </div>
+                <div class="card-value"><?php echo $totalJourneys; ?></div>
+                <div class="card-label">Total Journeys</div>
+                <?php if($filtersActive): ?>
+                    <div class="card-note">Filtered data</div>
+                <?php endif; ?>
+            </div>
+            
+            <div class="card">
+                <div class="card-icon">
+                    <i class="fas fa-tachometer-alt"></i>
+                </div>
+                <div class="card-value"><?php echo number_format($avgKm, 2); ?> km</div>
+                <div class="card-label">Average per Journey</div>
+                <?php if($filtersActive): ?>
+                    <div class="card-note">Filtered data</div>
+                <?php endif; ?>
+            </div>
+            
+            <div class="card">
+                <div class="card-icon">
+                    <i class="fas fa-cloud-sun"></i>
+                </div>
+                <div class="card-value"><?php echo $mostCommonWeather; ?></div>
+                <div class="card-label">Most Common Weather</div>
+                <?php if($filtersActive): ?>
+                    <div class="card-note">Filtered data</div>
+                <?php endif; ?>
+            </div>
+        </section>
+
+        <?php if (!empty($experiences)): ?>
+            <!-- Data Table -->
+            <section class="table-section">
+                <h2><i class="fas fa-table"></i> Driving Experiences (<?php echo $totalJourneys; ?>)</h2>
+                
+                <div style="overflow-x: auto;">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Start</th>
+                                <th>End</th>
+                                <th>Duration</th>
+                                <th>Distance</th>
+                                <th>Weather</th>
+                                <th>Traffic</th>
+                                <th>Road Type</th>
+                                <th>Maneuvers</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($experiences as $exp): ?>
+                                <tr>
+                                    <td><strong><?php echo htmlspecialchars($exp['DateOfJourney']); ?></strong></td>
+                                    <td><?php echo htmlspecialchars($exp['StartingTime']); ?></td>
+                                    <td><?php echo htmlspecialchars($exp['EndingTime']); ?></td>
+                                    <td><?php echo htmlspecialchars($exp['duration'] ?? 'N/A'); ?></td>
+                                    <td><strong><?php echo number_format($exp['TraveledKm'], 2); ?> km</strong></td>
+                                    <td>
+                                        <span class="badge weather-badge">
+                                            <?php echo htmlspecialchars($exp['weather_condition']); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <span class="badge traffic-badge">
+                                            <?php echo htmlspecialchars($exp['traffic_density']); ?>
+                                        </span>
+                                    </td>
+                                    <td><?php echo htmlspecialchars($exp['road_type']); ?></td>
+                                    <td><?php echo htmlspecialchars($exp['maneuvers_list'] ?? 'None'); ?></td>
+                                    <td>
+                                        <div class="action-buttons">
+                                            <button class="btn-small btn-edit" onclick="editExperience(<?php echo $exp['Driving_Id']; ?>)">
+                                                <i class="fas fa-edit"></i> Edit
+                                            </button>
+                                            <button class="btn-small btn-delete" onclick="deleteExperience(<?php echo $exp['Driving_Id']; ?>)">
+                                                <i class="fas fa-trash"></i> Delete
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Basic Charts -->
+            <section id="charts" class="charts-section">
+                <h2 style="color: #667eea; margin-bottom: 25px; display: flex; align-items: center; gap: 10px;">
+                    <i class="fas fa-chart-pie"></i> Distribution Charts
+                </h2>
+                
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3><i class="fas fa-cloud-sun"></i> Weather Distribution</h3>
+                        <div class="chart-container">
+                            <canvas id="weatherChart"></canvas>
+                        </div>
+                        <p class="chart-note">Distribution of weather conditions during drives</p>
+                    </div>
+                    
+                    <div class="chart-card">
+                        <h3><i class="fas fa-traffic-light"></i> Traffic Density</h3>
+                        <div class="chart-container">
+                            <canvas id="trafficChart"></canvas>
+                        </div>
+                        <p class="chart-note">Frequency of different traffic conditions</p>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- NEW: Evolution Charts Section -->
+            <section class="charts-section" style="margin-top: 40px;">
+                <h2 style="color: #667eea; margin-bottom: 25px; display: flex; align-items: center; gap: 10px;">
+                    <i class="fas fa-chart-line"></i> Evolution Over Time
+                </h2>
+                
+                <div class="charts-grid">
+                    <!-- Chart 1: Distance Over Time -->
+                    <div class="chart-card">
+                        <h3><i class="fas fa-road"></i> Distance Over Time</h3>
+                        <div class="chart-container">
+                            <canvas id="distanceOverTimeChart"></canvas>
+                        </div>
+                        <p class="chart-note">Shows total kilometers driven per day</p>
+                    </div>
+                    
+                    <!-- Chart 2: Experiences Per Month -->
+                    <div class="chart-card">
+                        <h3><i class="fas fa-calendar-alt"></i> Experiences Per Month</h3>
+                        <div class="chart-container">
+                            <canvas id="monthlyChart"></canvas>
+                        </div>
+                        <p class="chart-note">Top 5 months with most driving experiences</p>
+                    </div>
+                    
+                    <!-- Chart 3: Average Distance by Day of Week -->
+                    <div class="chart-card">
+                        <h3><i class="fas fa-calendar-day"></i> Average Distance by Day</h3>
+                        <div class="chart-container">
+                            <canvas id="dayOfWeekChart"></canvas>
+                        </div>
+                        <p class="chart-note">Average kilometers driven by day of week</p>
+                    </div>
+                    
+                    <!-- Chart 4: Experiences Trend -->
+                    <div class="chart-card">
+                        <h3><i class="fas fa-chart-area"></i> Experiences Trend</h3>
+                        <div class="chart-container">
+                            <canvas id="experienceTrendChart"></canvas>
+                        </div>
+                        <p class="chart-note">Number of driving experiences over time</p>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Simple Chart Script -->
+            <script>
+                // Weather Chart
+                const weatherCtx = document.getElementById('weatherChart').getContext('2d');
+                const weatherChart = new Chart(weatherCtx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: <?php echo json_encode(array_keys($weatherStats)); ?>,
+                        datasets: [{
+                            data: <?php echo json_encode(array_values($weatherStats)); ?>,
+                            backgroundColor: [
+                                '#667eea', '#764ba2', '#f093fb', '#f5576c',
+                                '#4facfe', '#00f2fe', '#43e97b', '#38f9d7'
+                            ],
+                            borderWidth: 2,
+                            borderColor: '#fff'
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'right'
+                            }
+                        }
+                    }
+                });
+                
+                // Traffic Chart
+                const trafficCtx = document.getElementById('trafficChart').getContext('2d');
+                const trafficChart = new Chart(trafficCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: <?php echo json_encode(array_keys($trafficStats)); ?>,
+                        datasets: [{
+                            label: 'Number of Journeys',
+                            data: <?php echo json_encode(array_values($trafficStats)); ?>,
+                            backgroundColor: 'rgba(102, 126, 234, 0.8)',
+                            borderColor: 'rgba(102, 126, 234, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                // ========== NEW EVOLUTION CHARTS ==========
+                // 1. Distance Over Time Chart (Line Chart)
+                const distanceCtx = document.getElementById('distanceOverTimeChart').getContext('2d');
+                const distanceChart = new Chart(distanceCtx, {
+                    type: 'line',
+                    data: {
+                        labels: <?php echo json_encode($timeLabels); ?>,
+                        datasets: [{
+                            label: 'Distance (km)',
+                            data: <?php echo json_encode($distanceTotals); ?>,
+                            borderColor: '#667eea',
+                            backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                title: {
+                                    display: true,
+                                    text: 'Kilometers'
+                                }
+                            },
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Date'
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 2. Monthly Chart (Bar Chart)
+                const monthlyCtx = document.getElementById('monthlyChart').getContext('2d');
+                const monthlyChart = new Chart(monthlyCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: <?php echo json_encode(array_keys($topMonths)); ?>,
+                        datasets: [{
+                            label: 'Number of Experiences',
+                            data: <?php echo json_encode(array_values($topMonths)); ?>,
+                            backgroundColor: [
+                                '#ff6384', '#36a2eb', '#ffce56', '#4bc0c0', 
+                                '#9966ff', '#ff9f40', '#ff6384'
+                            ],
+                            borderColor: [
+                                '#ff6384', '#36a2eb', '#ffce56', '#4bc0c0', 
+                                '#9966ff', '#ff9f40', '#ff6384'
+                            ],
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                display: false
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 3. Day of Week Chart (Bar Chart)
+                const dayCtx = document.getElementById('dayOfWeekChart').getContext('2d');
+                const dayChart = new Chart(dayCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                        datasets: [{
+                            label: 'Average Distance (km)',
+                            data: <?php echo json_encode(array_values($dayOfWeekAvg)); ?>,
+                            backgroundColor: 'rgba(75, 192, 192, 0.8)',
+                            borderColor: 'rgba(75, 192, 192, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                title: {
+                                    display: true,
+                                    text: 'Kilometers'
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 4. Experience Trend Chart (Line Chart)
+                const trendCtx = document.getElementById('experienceTrendChart').getContext('2d');
+                const trendChart = new Chart(trendCtx, {
+                    type: 'line',
+                    data: {
+                        labels: <?php echo json_encode($timeLabels); ?>,
+                        datasets: [{
+                            label: 'Number of Experiences',
+                            data: <?php echo json_encode($experienceCounts); ?>,
+                            borderColor: '#764ba2',
+                            backgroundColor: 'rgba(118, 75, 162, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Update charts on window resize
+                window.addEventListener('resize', function() {
+                    weatherChart.resize();
+                    trafficChart.resize();
+                    distanceChart.resize();
+                    monthlyChart.resize();
+                    dayChart.resize();
+                    trendChart.resize();
+                });
+                // ========== END EVOLUTION CHARTS ==========
+            </script>
+            
+        <?php else: ?>
+            <!-- No Data -->
+            <section class="no-data">
+                <i class="fas fa-clipboard-list"></i>
+                <h3>
+                    <?php if($filtersActive): ?>
+                        No Experiences Match Your Filters
+                    <?php else: ?>
+                        No Driving Experiences Yet
+                    <?php endif; ?>
+                </h3>
+                <p>
+                    <?php if($filtersActive): ?>
+                        Try adjusting your search criteria or clear filters to see all records.
+                    <?php else: ?>
+                        Start by adding your first driving experience to see statistics and insights.
+                    <?php endif; ?>
+                </p>
+                <a href="index.php" class="btn btn-primary" style="margin-right: 10px;">
+                    <i class="fas fa-plus-circle"></i> Add First Experience
+                </a>
+                <?php if($filtersActive): ?>
+                    <a href="summaryreport.php" class="btn btn-secondary">
+                        <i class="fas fa-redo"></i> Clear Filters
+                    </a>
+                <?php endif; ?>
+            </section>
+        <?php endif; ?>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p><strong>Driving Experience Assistant</strong> &copy; 2025</p>
+            <p style="font-size: 14px; color: #888; margin-top: 10px;">Track and analyze your driving journeys</p>
+        </footer>
+    </div>
+
+    <script>
+        function resetFilters() {
+            document.getElementById('filterForm').reset();
+            window.location.href = 'summaryreport.php';
+        }
+        
+        function editExperience(id) {
+            window.location.href = 'edit_experience.php?id=' + id;
+        }
+        
+        function deleteExperience(id) {
+            if (confirm('Are you sure you want to delete this driving experience?')) {
+                fetch('delete_experience.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: 'id=' + id
+                })
+                .then(response => location.reload())
+                .catch(error => {
+                    console.error('Error:', error);
+                    location.reload();
+                });
+            }
+        }
+    </script>
+</body>
+</html>
